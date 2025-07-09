@@ -1,5 +1,7 @@
 # Keycloak Authentication Implementation Guide
 
+Our architecture embraces a hybrid security model that separates broad identity management from fine-grained application permissions. We use Keycloak exclusively for its core strengths: authenticating users and assigning a small, consistent set of universal roles (e.g., `admin`, `manager`, `user`) that define a person's general function within the organization. All specific, resource-level authorization—such as determining if a user can edit a particular project or view a specific document—is handled within the application itself. This philosophy prevents "role explosion" in Keycloak, keeping user management simple and scalable, while empowering each application to enforce its own detailed access control logic, ensuring that security is both robust and context-aware.
+
 ## Quick Start
 
 This guide shows you exactly how to implement Keycloak authentication in your React + Express.js projects using **TypeScript** (recommended). Follow these steps to get authentication working.

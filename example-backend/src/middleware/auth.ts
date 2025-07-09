@@ -64,7 +64,7 @@ export const jwtCheck = expressjwt({
    // For more granular control, apply this middleware selectively or use .unless()
 });
 
-function getRolesFromToken(decodedToken: DecodedJwt | undefined): string[] {
+export function getRolesFromToken(decodedToken: DecodedJwt | undefined): string[] {
    if (!decodedToken) {
       return [];
    }

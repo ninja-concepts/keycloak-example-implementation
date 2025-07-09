@@ -5,45 +5,61 @@ import './App.css';
 
 function MyComponent() {
   const { user, isAuthenticated, signIn, signOut, hasRole, loading: authLoading } = useAuth();
-  const { apiCall, loading: apiLoading, error, } = useApiCall();
-  const [userInfo, setUserInfo] = useState<any>(null);
+  const { apiCall, loading: apiLoading } = useApiCall();
+  
+  const [projectData, setProjectData] = useState<any>(null);
+  const [apiError, setApiError] = useState<string | null>(null);
 
-  const handleFetchUserInfo = async () => {
+  const fetchProject = async (projectId: string) => {
+    setProjectData(null);
+    setApiError(null);
     try {
-      const data = await apiCall('/api/user-info');
-      setUserInfo(data);
-    } catch (err) {
-      // error is already set by the hook
-      setUserInfo(null);
+      // The backend will check if this user has access to this specific project
+      const data = await apiCall(`/api/projects/${projectId}`);
+      setProjectData(data);
+    } catch (err: any) {
+      setApiError(err.message);
     }
   };
 
-  if (authLoading) return <div>Loading...</div>;
-
-  if (!isAuthenticated) {
-    return <button onClick={() => signIn()}>Sign In</button>;
-  }
+  if (authLoading) return <div>Authenticating...</div>;
+  if (!isAuthenticated) return <button onClick={signIn}>Sign In</button>;
 
   return (
     <div>
       <h1>Welcome, {user?.name}!</h1>
-      <p>Email: {user?.email}</p>
+      <p>Your User ID: <code>{user?.id}</code></p>
+      <p>Your Roles: <code>{user?.roles?.join(', ')}</code></p>
+      <button onClick={signOut}>Sign Out</button>
 
+      {/* Role-based UI element */}
       {hasRole('admin') && (
-        <button>This button should be visible only for admin users</button>
+        <button>This button is visible only for admin users</button>
       )}
 
-      <button onClick={() => signOut()}>Sign Out</button>
-
       <div className="card">
-        <button onClick={handleFetchUserInfo} disabled={apiLoading}>
-          {apiLoading ? 'Fetching User Info...' : 'Fetch User Info from API'}
-        </button>
-        {error && <p className="error">Error: {error.message}</p>}
-        {userInfo && (
+        <h3>Resource Access Control Demo</h3>
+        <p>
+          Try accessing two different projects. The backend will grant access to 
+          "My Project" but deny access to "Other Project" based on your User ID.
+        </p>
+        <div className="buttons">
+          {/* This project is owned by the logged-in user, so access will be granted */}
+          <button onClick={() => fetchProject('project-123')} disabled={apiLoading}>
+            Fetch "My Project" (Should Succeed)
+          </button>
+          {/* This project is owned by someone else, so access will be denied (403 Forbidden) */}
+          <button onClick={() => fetchProject('project-456')} disabled={apiLoading}>
+            Fetch "Other Project" (Should Fail)
+          </button>
+        </div>
+
+        {apiLoading && <div>Loading...</div>}
+        {apiError && <div className="error">API Error: {apiError}</div>}
+        {projectData && (
           <div>
-            <h3>API Response:</h3>
-            <pre>{JSON.stringify(userInfo, null, 2)}</pre>
+            <h3>✅ Access Granted:</h3>
+            <pre>{JSON.stringify(projectData, null, 2)}</pre>
           </div>
         )}
       </div>
