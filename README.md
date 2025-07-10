@@ -1,5 +1,70 @@
 # Keycloak Multi-Tenant Implementation Guide
 
+## Table of Contents
+- [Getting Started](#getting-started)
+- [Environment Variables](#environment-variables)
+- [Keycloak Setup](#-keycloak-setup-adding-tenant-info-to-tokens)
+- [Backend Setup (Express.js + TypeScript)](#-backend-setup-expressjs--typescript)
+- [Frontend Setup (React + TypeScript)](#-frontend-setup-react--typescript)
+- [Security Rules](#-security-rules)
+
+## Getting Started
+
+### Prerequisites
+- Node.js v20 or newer
+- Yarn or npm
+- A running Keycloak instance (e.g., via Docker)
+
+### Install & Run
+
+#### Backend
+```bash
+cd example-backend
+cp .env.example .env
+npm install
+npm run dev
+```
+
+#### Frontend
+```bash
+cd example-frontend
+cp .env.example .env
+npm install
+npm run dev
+```
+
+### Sample .env files
+
+```bash
+# example-backend/.env
+KEYCLOAK_URL=https://auth.example.com
+KEYCLOAK_REALM=myrealm
+KEYCLOAK_CLIENT_ID=my-client
+
+# example-frontend/.vite.env
+VITE_KEYCLOAK_URL=https://auth.example.com
+VITE_KEYCLOAK_REALM=myrealm
+VITE_KEYCLOAK_CLIENT_ID=my-client
+```
+
+## Environment Variables
+
+| Name                    | Required | Description                                     | Example                   |
+|-------------------------|:--------:|-------------------------------------------------|---------------------------|
+| KEYCLOAK_URL            |   Yes    | Base URL of the Keycloak server                 | https://auth.example.com  |
+| KEYCLOAK_REALM          |   Yes    | Keycloak realm name                             | myrealm                   |
+| KEYCLOAK_CLIENT_ID      |   Yes    | Keycloak client ID for the backend              | my-client                 |
+| VITE_KEYCLOAK_URL       |   Yes    | Base URL of the Keycloak server (frontend)      | https://auth.example.com  |
+| VITE_KEYCLOAK_REALM     |   Yes    | Keycloak realm name (frontend)                  | myrealm                   |
+| VITE_KEYCLOAK_CLIENT_ID |   Yes    | Keycloak client ID (frontend)                   | my-client                 |
+| PORT                    |    No    | Backend server port (default: 3001)             | 4000                      |
+
+## Callouts & Disclaimers
+
+- ⚠️ The in-memory `userPermissionsDb` in `src/middleware/tenantContext.ts` is a **placeholder**. Replace it with your own database or ACL service.
+- 🚧 This template omits production hardening (CORS, rate-limiting, Helmet, structured logging). Add these before going live.
+- ⚠️ There is no `/me/permissions` endpoint by default—either implement it or adjust your frontend accordingly.
+
 Our architecture uses a powerful, clean separation of concerns for security in a multi-tenant environment. We use Keycloak as a centralized **Identity Provider (IdP)**. Its sole responsibility is to **authenticate users** and assert which **tenants (companies) they belong to** using Keycloak's "Groups" feature.
 
 All fine-grained authorization—such as determining if a user is an `admin` within a specific company or has access to a particular product—is handled **entirely within the application itself**. The application's backend is the single source of truth for permissions. This philosophy prevents complexity in Keycloak, keeps user management simple, and empowers each tenant to have its own robust and context-aware access control.
