@@ -10,7 +10,8 @@ interface User {
    name?: string
    firstName?: string
    lastName?: string
-   roles?: string[]
+   // The `roles` field is removed, as global roles are no longer used.
+   // Tenant-specific roles are handled by the backend.
    emailVerified?: boolean
 }
 
@@ -22,7 +23,8 @@ interface AuthContextType {
    signIn: () => void
    signOut: () => void
    getToken: () => Promise<string | undefined>
-   hasRole: (role: string) => boolean
+   // The `hasRole` function is removed. All role checks are now API-driven
+   // and context-dependent (i.e., based on the selected tenant).
 }
 
 interface AuthProviderProps {
@@ -48,7 +50,8 @@ export function AuthProvider({ children }: AuthProviderProps) {
             firstName: kc.tokenParsed.given_name,
             lastName: kc.tokenParsed.family_name,
             emailVerified: kc.tokenParsed.email_verified,
-            roles: kc.tokenParsed.realm_access?.roles || [],
+            // We no longer parse `roles` here. The user's permissions are contextual
+            // to the selected tenant and will be fetched from the API.
          }
          setUser(profile)
          console.log('AuthContext: User parsed', profile)
@@ -152,12 +155,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
       return undefined
    }, [keycloakInstance])
 
-   const hasRole = useCallback((role: string): boolean => {
-      if (!keycloakInstance || !keycloakInstance.authenticated || !user || !user.roles) {
-         return false
-      }
-      return user.roles.includes(role)
-   }, [keycloakInstance, user])
+   // The `hasRole` function has been removed.
 
    return (
       <AuthContext.Provider value={{
@@ -168,7 +166,6 @@ export function AuthProvider({ children }: AuthProviderProps) {
          signIn,
          signOut,
          getToken,
-         hasRole
       }}>
          {children}
       </AuthContext.Provider>

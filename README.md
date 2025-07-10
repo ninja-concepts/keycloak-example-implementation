@@ -1,411 +1,45 @@
-# Keycloak Authentication Implementation Guide
+# Keycloak Multi-Tenant Implementation Guide
 
-Our architecture embraces a hybrid security model that separates broad identity management from fine-grained application permissions. We use Keycloak exclusively for its core strengths: authenticating users and assigning a small, consistent set of universal roles (e.g., `admin`, `manager`, `user`) that define a person's general function within the organization. All specific, resource-level authorization—such as determining if a user can edit a particular project or view a specific document—is handled within the application itself. This philosophy prevents "role explosion" in Keycloak, keeping user management simple and scalable, while empowering each application to enforce its own detailed access control logic, ensuring that security is both robust and context-aware.
+Our architecture uses a powerful, clean separation of concerns for security in a multi-tenant environment. We use Keycloak as a centralized **Identity Provider (IdP)**. Its sole responsibility is to **authenticate users** and assert which **tenants (companies) they belong to** using Keycloak's "Groups" feature.
 
-## Quick Start
+All fine-grained authorization—such as determining if a user is an `admin` within a specific company or has access to a particular product—is handled **entirely within the application itself**. The application's backend is the single source of truth for permissions. This philosophy prevents complexity in Keycloak, keeps user management simple, and empowers each tenant to have its own robust and context-aware access control.
 
-This guide shows you exactly how to implement Keycloak authentication in your React + Express.js projects using **TypeScript** (recommended). Follow these steps to get authentication working.
+This guide shows you how to implement this architecture in your React + Express.js projects using TypeScript.
 
 > **Note**: Always use TypeScript for better type safety and developer experience. All examples below are in TypeScript.
 
-## 🚀 Frontend Setup (React + TypeScript)
+---
 
-### Step 1: Install Dependencies
+## 🚀 Keycloak Setup: Adding Tenant Info to Tokens
 
-```bash
-npm install keycloak-js
-npm install -D @types/keycloak-js
-```
+Before touching the code, you must configure Keycloak to include the user's group memberships (tenants) in the access token. This is how the backend will know which companies a user belongs to.
 
-### Step 2: Create Keycloak Configuration
+1.  In your Keycloak admin console, navigate to your client.
+2.  Go to the **Client Scopes** tab (e.g., `your-client-dedicated-scope`).
+3.  Click on the **Mappers** tab.
+4.  Click **Add mapper** and choose **By Configuration**.
+5.  Select the **Group Membership** mapper.
+6.  Give it a name (e.g., "groups"). The **Token Claim Name** will also be `groups`. This is the property that will appear in the JWT.
+7.  Turn **ON** the **Full group path** setting. This ensures group names are unique (e.g., `/company-a` instead of just `company-a`).
+8.  Click **Save**.
 
-Create `src/lib/keycloak.ts`:
-
-```typescript
-import Keycloak from 'keycloak-js';
-
-const keycloakConfig = {
-   url: import.meta.env.VITE_KEYCLOAK_URL!, // Vite uses import.meta.env
-   realm: import.meta.env.VITE_KEYCLOAK_REALM!,
-   clientId: import.meta.env.VITE_KEYCLOAK_CLIENT_ID!
-};
-
-const keycloak = new Keycloak(keycloakConfig);
-
-/**
- * Because React Strict-Mode (development) intentionally mounts components twice and
- * because multiple places in the codebase may try to call `initKeycloak`, we need
- * to guarantee that `keycloak.init` is executed **only once**.  Invoking it again
- * throws `Error: A 'Keycloak' instance can only be initialized once.`  We solve
- * this by memoising the initialisation promise.
- */
-let initPromise: Promise<Keycloak> | null = null;
-
-/**
- * Initializes Keycloak instance and makes it available globally.
- *
- * @param {() => void} onAuthenticatedCallback - Callback function to execute after successful authentication.
- * @returns {Promise<Keycloak>} A promise that resolves to the Keycloak instance.
- */
-export const initKeycloak = (onAuthenticatedCallback: (kc: Keycloak) => void): Promise<Keycloak> => {
-   // If initialisation already in progress or finished, just hook into that
-   if (initPromise) {
-      initPromise.then((kc) => {
-         if (kc.authenticated) {
-            // Fire callback for late subscribers that still care about auth state
-            onAuthenticatedCallback(kc)
-         }
-      })
-      return initPromise
-   }
-
-   initPromise = new Promise((resolve, reject) => {
-      console.log('Keycloak: Attempting init with onLoad: login-required and checkLoginIframe: false');
-      keycloak.init({
-         onLoad: 'login-required',
-         pkceMethod: 'S256', // Recommended for public clients
-         checkLoginIframe: false, // Explicitly disable session status iframe
-      })
-         .then((authenticated) => {
-            console.log(`Keycloak: Init completed. Authenticated: ${authenticated}`);
-            if (authenticated) {
-               console.log('Keycloak: User is authenticated');
-               onAuthenticatedCallback(keycloak);
-               resolve(keycloak);
-            } else {
-               console.warn('Keycloak: User is not authenticated after init with login-required.');
-               // For login-required, if not authenticated, Keycloak should have redirected.
-               // If we reach here without authentication, it might mean the redirect didn't happen or was blocked.
-               resolve(keycloak); // Still resolve, AuthContext will handle state based on isAuthenticated
-            }
-
-            // Token refresh mechanism - only set up if authenticated
-            if (authenticated) {
-               setInterval(() => {
-                  keycloak.updateToken(70).then((refreshed) => {
-                     if (refreshed) {
-                        console.log('Keycloak: Token refreshed');
-                     } else {
-                        if (keycloak.tokenParsed && typeof keycloak.tokenParsed.exp === 'number' && typeof keycloak.timeSkew !== 'undefined') {
-                           console.log('Keycloak: Token not refreshed, valid for ' + Math.round(keycloak.tokenParsed.exp + keycloak.timeSkew - new Date().getTime() / 1000) + ' seconds');
-                        } else {
-                           console.log('Keycloak: Token not refreshed, unable to determine validity (tokenParsed or exp missing, or timeSkew undefined).');
-                        }
-                     }
-                  }).catch(() => {
-                     console.error('Keycloak: Failed to refresh token');
-                  });
-               }, 60000); // Refresh every 60 seconds
-            }
-         })
-         .catch((error) => {
-            console.error('Keycloak: Initialization Failed during init()', error);
-            // Allow subsequent attempts if this one failed
-            initPromise = null;
-            reject(error);
-         });
-   });
-
-   return initPromise;
-};
-
-export default keycloak;
-```
-
-### Step 3: Copy the AuthContext Hook
-
-Create `src/contexts/AuthContext.tsx` and copy this code exactly:
-
-```typescript
-import { createContext, useContext, useState, useEffect, ReactNode, useCallback, useRef } from 'react'
-import Keycloak from 'keycloak-js'
-import { initKeycloak } from '../lib/keycloak'
-
-interface User {
-   id?: string
-   username?: string
-   email?: string
-   name?: string
-   firstName?: string
-   lastName?: string
-   roles?: string[]
-   emailVerified?: boolean
-}
-
-interface AuthContextType {
-   keycloak: Keycloak | null
-   user: User | null
-   loading: boolean
-   isAuthenticated: boolean
-   signIn: () => void
-   signOut: () => void
-   getToken: () => Promise<string | undefined>
-   hasRole: (role: string) => boolean
-}
-
-interface AuthProviderProps {
-   children: ReactNode
-}
-
-const AuthContext = createContext<AuthContextType | undefined>(undefined)
-
-export function AuthProvider({ children }: AuthProviderProps) {
-   const [keycloakInstance, setKeycloakInstance] = useState<Keycloak | null>(null)
-   const [user, setUser] = useState<User | null>(null)
-   const [loading, setLoading] = useState<boolean>(true)
-
-   const hasRunRef = useRef(false)
-
-   const parseUser = useCallback(async (kc: Keycloak) => {
-      if (kc.tokenParsed) {
-         const profile: User = {
-            id: kc.tokenParsed.sub,
-            username: kc.tokenParsed.preferred_username,
-            email: kc.tokenParsed.email,
-            name: kc.tokenParsed.name,
-            firstName: kc.tokenParsed.given_name,
-            lastName: kc.tokenParsed.family_name,
-            emailVerified: kc.tokenParsed.email_verified,
-            roles: kc.tokenParsed.realm_access?.roles || [],
-         }
-         setUser(profile)
-         console.log('AuthContext: User parsed', profile)
-      } else {
-         setUser(null)
-         console.log('AuthContext: Token not parsed, user set to null')
-      }
-   }, [])
-
-   useEffect(() => {
-      // Prevent double-initialisation in React Strict Mode (dev) or rerenders
-      if (hasRunRef.current) return
-      hasRunRef.current = true
-
-      const initialize = async () => {
-         console.log('AuthContext: Starting Keycloak initialization...')
-         try {
-            const kc = await initKeycloak((kcInstance) => {
-               console.log('AuthContext: initKeycloak onAuthenticatedCallback triggered.')
-               setKeycloakInstance(kcInstance)
-               if (kcInstance.authenticated) {
-                  parseUser(kcInstance)
-               }
-            })
-            console.log(`AuthContext: Keycloak instance initialized. kc.authenticated: ${kc.authenticated}`)
-            setKeycloakInstance(kc)
-            if (kc.authenticated) {
-               await parseUser(kc)
-            } else {
-               console.log('AuthContext: Keycloak initialized but user is not authenticated (onLoad: login-required). User should have been redirected to Keycloak login.')
-            }
-         } catch (error) {
-            console.error("AuthContext: Keycloak initialization error in AuthContext:", error)
-            setUser(null)
-         } finally {
-            setLoading(false)
-            console.log('AuthContext: Keycloak initialization attempt finished. Loading set to false.')
-         }
-      }
-      initialize()
-   }, [parseUser])
-
-   useEffect(() => {
-      if (keycloakInstance) {
-         keycloakInstance.onAuthSuccess = async () => {
-            console.log('AuthContext: onAuthSuccess event triggered.')
-            await parseUser(keycloakInstance)
-            setLoading(false)
-         }
-         keycloakInstance.onAuthError = (errorData) => {
-            console.error('AuthContext: onAuthError', errorData)
-            setUser(null)
-            setLoading(false)
-         }
-         keycloakInstance.onAuthRefreshSuccess = async () => {
-            console.log('AuthContext: onAuthRefreshSuccess')
-            await parseUser(keycloakInstance)
-         }
-         keycloakInstance.onAuthRefreshError = () => {
-            console.error('AuthContext: onAuthRefreshError')
-            setUser(null)
-         }
-         keycloakInstance.onAuthLogout = () => {
-            console.log('AuthContext: onAuthLogout')
-            setUser(null)
-         }
-         keycloakInstance.onTokenExpired = () => {
-            console.warn('AuthContext: onTokenExpired')
-            keycloakInstance.updateToken(30).catch(() => {
-               console.error('AuthContext: Failed to refresh token after expiry, logging out.')
-               setUser(null)
-            })
-         }
-      }
-   }, [keycloakInstance, parseUser])
-
-   const signIn = useCallback(() => {
-      if (keycloakInstance) {
-         console.log('AuthContext: signIn called. Redirecting to Keycloak with redirectUri: ' + window.location.origin + '/')
-         keycloakInstance.login({ redirectUri: window.location.origin + '/' })
-      }
-   }, [keycloakInstance])
-
-   const signOut = useCallback(() => {
-      if (keycloakInstance) {
-         console.log('AuthContext: signOut called. Redirecting to Keycloak logout.')
-         keycloakInstance.logout({ redirectUri: window.location.origin + '/login' })
-      }
-   }, [keycloakInstance])
-
-   const getToken = useCallback(async (): Promise<string | undefined> => {
-      if (keycloakInstance && keycloakInstance.token) {
-         try {
-            await keycloakInstance.updateToken(5)
-            return keycloakInstance.token
-         } catch (error) {
-            console.error('AuthContext: Failed to refresh token in getToken', error)
-            return undefined
-         }
-      }
-      return undefined
-   }, [keycloakInstance])
-
-   const hasRole = useCallback((role: string): boolean => {
-      if (!keycloakInstance || !keycloakInstance.authenticated || !user || !user.roles) {
-         return false
-      }
-      return user.roles.includes(role)
-   }, [keycloakInstance, user])
-
-   return (
-      <AuthContext.Provider value={{
-         keycloak: keycloakInstance,
-         user,
-         loading,
-         isAuthenticated: !!keycloakInstance?.authenticated,
-         signIn,
-         signOut,
-         getToken,
-         hasRole
-      }}>
-         {children}
-      </AuthContext.Provider>
-   )
-}
-
-export const useAuth = (): AuthContextType => {
-   const context = useContext(AuthContext)
-   if (!context) {
-      throw new Error('useAuth must be used within AuthProvider')
-   }
-   return context
+After this, a logged-in user's access token will contain a `groups` array:
+```json
+{
+  "sub": "user-uuid-12345",
+  "groups": [
+    "/company-a",
+    "/company-b"
+  ],
+  ...
 }
 ```
 
-### Step 4: Wrap Your App
-
-In your `src/App.tsx`:
-
-```tsx
-import { AuthProvider } from './contexts/AuthContext'
-
-function App() {
-  return (
-    <AuthProvider>
-      {/* Your existing app components */}
-      <YourAppComponents />
-    </AuthProvider>
-  )
-}
-
-export default App
-```
-
-### Step 5: Environment Variables
-
-Add to your `.env`:
-
-```env
-VITE_KEYCLOAK_URL=https://your-keycloak-server.com
-VITE_KEYCLOAK_REALM=your-realm-name
-VITE_KEYCLOAK_CLIENT_ID=your-client-id
-```
-
-### Step 6: Use in Components
-
-```tsx
-import { useAuth } from '../contexts/AuthContext'
-
-function MyComponent() {
-  const { user, isAuthenticated, signIn, signOut, hasRole, loading } = useAuth()
-  
-  if (loading) return <div>Loading...</div>
-  
-  if (!isAuthenticated) {
-    return <button onClick={signIn}>Sign In</button>
-  }
-  
-  return (
-    <div>
-      <h1>Welcome, {user?.name}!</h1>
-      <p>Email: {user?.email}</p>
-      
-      {hasRole('admin') && (
-        <button>Admin Panel</button>
-      )}
-      
-      <button onClick={signOut}>Sign Out</button>
-    </div>
-  )
-}
-```
-
-### Step 7: Making API Calls
-
-Always include the token in your API calls:
-
-```tsx
-import { useAuth } from '../contexts/AuthContext'
-
-function useApiCall() {
-  const { getToken } = useAuth()
-
-  const fetchData = async <T>(endpoint: string): Promise<T> => {
-    const token = await getToken()
-    
-    const response = await fetch(endpoint, {
-      headers: {
-        'Authorization': `Bearer ${token}`,
-        'Content-Type': 'application/json'
-      }
-    })
-    
-    if (!response.ok) {
-      throw new Error(`HTTP error! status: ${response.status}`)
-    }
-    
-    return response.json()
-  }
-
-  return { fetchData }
-}
-
-// Usage in component
-function DataComponent() {
-  const { fetchData } = useApiCall()
-  const [data, setData] = useState<any>(null)
-
-  useEffect(() => {
-    fetchData('/api/some-endpoint')
-      .then(setData)
-      .catch(console.error)
-  }, [])
-
-  return <div>{JSON.stringify(data)}</div>
-}
-```
+---
 
 ## 🔧 Backend Setup (Express.js + TypeScript)
+
+The backend is responsible for enforcing all authorization rules based on the tenant context.
 
 ### Step 1: Install Dependencies
 
@@ -414,51 +48,23 @@ npm install express express-jwt jwks-rsa
 npm install -D @types/express @types/node typescript ts-node
 ```
 
-### Step 2: Copy the Auth Middleware
+### Step 2: Update Authentication Middleware (`src/middleware/auth.ts`)
 
-Create `src/middleware/auth.ts` and copy this code exactly:
+This middleware is now only responsible for **authentication**. It verifies the JWT and attaches the user's identity (`req.auth`) to the request. All role-based logic has been removed.
 
-```typescript
+```typescript:src/middleware/auth.ts
 import { expressjwt } from "express-jwt";
 import type { GetVerificationKey } from "express-jwt";
 import { expressJwtSecret } from "jwks-rsa";
 import { env } from "../config/env";
 import type { NextFunction, Request, Response } from "express";
 
-// Define the structure of the JWT payload we expect from Keycloak
 interface DecodedJwt {
-   exp: number;
-   iat: number;
-   auth_time?: number;
-   jti: string;
-   iss: string;
-   aud: string | string[];
    sub: string;
-   typ: string;
-   azp: string;
-   session_state?: string;
-   acr?: string;
-   'allowed-origins': string[];
-   realm_access?: {
-      roles?: string[];
-   };
-   resource_access?: {
-      [clientId: string]: {
-         roles?: string[];
-      };
-   };
-   scope?: string;
-   sid?: string;
-   email_verified?: boolean;
-   name?: string;
-   preferred_username?: string;
-   given_name?: string;
-   family_name?: string;
-   email?: string;
-   // Add any other custom claims you expect
+   groups?: string[]; // The `groups` claim from Keycloak
+   // ... other standard claims
 }
 
-// Extend Express Request type
 declare global {
    namespace Express {
       export interface Request {
@@ -469,7 +75,6 @@ declare global {
 
 const keycloakIssuer = `${env.KEYCLOAK_URL}/realms/${env.KEYCLOAK_REALM}`;
 
-// JWT validation middleware
 export const jwtCheck = expressjwt({
    secret: expressJwtSecret({
       cache: true,
@@ -477,98 +82,15 @@ export const jwtCheck = expressjwt({
       jwksRequestsPerMinute: 5,
       jwksUri: `${keycloakIssuer}/protocol/openid-connect/certs`,
    }) as GetVerificationKey,
-   audience: [env.KEYCLOAK_CLIENT_ID, "account"], // Temporarily accept "account" audience
+   audience: [env.KEYCLOAK_CLIENT_ID, "account"],
    issuer: keycloakIssuer,
    algorithms: ["RS256"],
-   // credentialsRequired: false, // Set to false if you want to allow access to routes even if no token is provided.
-   // req.auth will be undefined in such cases.
-   // For more granular control, apply this middleware selectively or use .unless()
 });
 
-function getRolesFromToken(decodedToken: DecodedJwt | undefined): string[] {
-   if (!decodedToken) {
-      return [];
-   }
-   // Prioritize resource_access roles for the specific client ID, then realm_access roles.
-   // Adjust env.KEYCLOAK_CLIENT_ID if a different client ID's roles are needed here.
-   const resourceRoles = decodedToken.resource_access?.[env.KEYCLOAK_CLIENT_ID]?.roles || [];
-   const realmRoles = decodedToken.realm_access?.roles || [];
-
-   // Using a Set to ensure uniqueness if roles overlap (unlikely for distinct resource/realm roles)
-   return Array.from(new Set([...resourceRoles, ...realmRoles]));
-}
-
-export function requireAdmin(req: Request, res: Response, next: NextFunction): void {
-   if (!req.auth) {
-      res.status(401).json({ message: "Authentication required", error: "UNAUTHORIZED" });
-      return;
-   }
-   const roles = getRolesFromToken(req.auth);
-   if (roles.includes("admin")) {
-      next();
-   } else {
-      console.warn('Admin access denied:', { userId: req.auth.sub, roles, requiredRole: "admin" });
-      res.status(403).json({
-         message: "Access denied: Administrator privileges required",
-         error: "FORBIDDEN"
-      });
-   }
-}
-
-export function requireRole(role: string) {
-   return (req: Request, res: Response, next: NextFunction): void => {
-      if (!req.auth) {
-         res.status(401).json({ message: "Authentication required", error: "UNAUTHORIZED" });
-         return;
-      }
-      const userRoles = getRolesFromToken(req.auth);
-      if (userRoles.includes(role)) {
-         next();
-      } else {
-         console.warn('Role access denied:', { userId: req.auth.sub, roles: userRoles, requiredRole: role });
-         res.status(403).json({
-            message: `Access denied: '${role}' role required`,
-            error: "FORBIDDEN"
-         });
-      }
-   };
-}
-
-export function requireAnyRole(roles: string[]) {
-   return (req: Request, res: Response, next: NextFunction): void => {
-      if (!req.auth) {
-         res.status(401).json({ message: "Authentication required", error: "UNAUTHORIZED" });
-         return;
-      }
-      const userRoles = getRolesFromToken(req.auth);
-      const hasRequiredRole = roles.some(role => userRoles.includes(role));
-
-      if (hasRequiredRole) {
-         next();
-      } else {
-         console.warn('Any role access denied:', { userId: req.auth.sub, roles: userRoles, requiredRoles: roles });
-         res.status(403).json({
-            message: `Access denied: One of the following roles required: ${roles.join(', ')}`,
-            error: "FORBIDDEN"
-         });
-      }
-   };
-}
-
-// Error handler for express-jwt errors.
-// This should be registered in app.ts AFTER routes and AFTER jwtCheck middleware.
 export function handleJwtError(err: any, req: Request, res: Response, next: NextFunction) {
    if (err.name === 'UnauthorizedError') {
-      console.warn('JWT UnauthorizedError:', { error: err.message, path: req.path, code: err.code });
       let message = "Access token is invalid or expired.";
-      if (err.code === 'credentials_required') {
-         message = "Access token is missing.";
-      } else if (err.code === 'invalid_token') {
-         message = "Access token is invalid.";
-      } else if (err.code === 'revoked_token') {
-         message = "Access token has been revoked.";
-      }
-
+      // ... error handling logic ...
       res.status(401).json({ message, error: "UNAUTHORIZED", code: err.code });
    } else {
       next(err);
@@ -576,324 +98,246 @@ export function handleJwtError(err: any, req: Request, res: Response, next: Next
 }
 ```
 
-### Step 3: Create Environment Config
+### Step 3: Create Tenant Context Middleware (`src/middleware/tenantContext.ts`)
 
-Create `src/config/env.ts`:
+This is the core of your new authorization system. It runs after `jwtCheck` and establishes the user's permissions for the company they are currently working in.
 
-```typescript
-export const env = {
-  KEYCLOAK_URL: process.env.KEYCLOAK_URL!,
-  KEYCLOAK_REALM: process.env.KEYCLOAK_REALM!,
-  KEYCLOAK_CLIENT_ID: process.env.KEYCLOAK_CLIENT_ID!,
-  // Add other env vars as needed
+```typescript:src/middleware/tenantContext.ts
+import type { Request, Response, NextFunction } from 'express';
+
+// Extend Express Request to include our tenant context
+declare global {
+   namespace Express {
+      export interface Request {
+         tenant?: {
+            id: string;
+            roles: string[]; // Roles specific to this tenant
+            products: string[]; // Products accessible in this tenant
+         };
+      }
+   }
 }
 
-// Validate required environment variables
-const requiredEnvVars = ['KEYCLOAK_URL', 'KEYCLOAK_REALM', 'KEYCLOAK_CLIENT_ID']
-for (const envVar of requiredEnvVars) {
-  if (!process.env[envVar]) {
-    throw new Error(`Missing required environment variable: ${envVar}`)
+// MOCK DATABASE: In a real app, you'd fetch this from a database.
+const userPermissionsDb = {
+  'user-uuid-12345': {
+    'company-a': { roles: ['admin'], products: ['product1', 'product3'] },
+    'company-b': { roles: ['user'], products: ['product2'] },
+  },
+};
+
+export async function tenantContext(req: Request, res: Response, next: NextFunction) {
+  const tenantId = req.headers['x-tenant-id'] as string;
+  const userId = req.auth?.sub;
+  const userGroups = req.auth?.groups || [];
+
+  if (!userId || !tenantId) {
+    return res.status(400).json({ message: 'User ID and X-Tenant-ID header are required.' });
   }
-}
-```
 
-### Step 4: Environment Variables
-
-Add to your `.env`:
-
-```env
-KEYCLOAK_URL=https://your-keycloak-server.com
-KEYCLOAK_REALM=your-realm-name
-KEYCLOAK_CLIENT_ID=your-client-id
-```
-
-### Step 5: Apply Middleware to Your Routes
-
-```typescript
-import express from 'express'
-import { jwtCheck, requireAdmin, requireRole, requireAnyRole, handleJwtError } from './middleware/auth'
-
-const app = express()
-
-// Apply JWT validation to all API routes
-app.use('/api', jwtCheck)
-
-// Public route (no auth needed)
-app.get('/api/public', (req: express.Request, res: express.Response) => {
-  res.json({ message: 'Anyone can access this' })
-})
-
-// Protected route (just need to be logged in)
-app.get('/api/protected', (req: express.Request, res: express.Response) => {
-  res.json({ 
-    message: 'You are logged in',
-    userId: req.auth?.sub,
-    username: req.auth?.preferred_username
-  })
-})
-
-// Admin only
-app.get('/api/admin-only', requireAdmin, (req: express.Request, res: express.Response) => {
-  res.json({ message: 'Admin access required' })
-})
-
-// Specific role required
-app.get('/api/manager-only', requireRole('manager'), (req: express.Request, res: express.Response) => {
-  res.json({ message: 'Manager role required' })
-})
-
-// Multiple roles accepted
-app.get('/api/staff-area', requireAnyRole(['staff', 'manager', 'admin']), (req: express.Request, res: express.Response) => {
-  res.json({ message: 'Staff, manager, or admin can access' })
-})
-
-// IMPORTANT: Add error handler AFTER all routes
-app.use(handleJwtError)
-
-export default app
-```
-
-### Step 6: Access User Info in Routes
-
-```typescript
-app.get('/api/user-info', (req: express.Request, res: express.Response) => {
-  const user = {
-    id: req.auth?.sub,
-    username: req.auth?.preferred_username,
-    email: req.auth?.email,
-    name: req.auth?.name,
-    roles: [
-      ...(req.auth?.realm_access?.roles || []),
-      ...(req.auth?.resource_access?.[process.env.KEYCLOAK_CLIENT_ID!]?.roles || [])
-    ]
+  // 1. Verify user is a member of the tenant (via Keycloak group)
+  if (!userGroups.includes(`/${tenantId}`)) {
+     return res.status(403).json({ message: `Access denied: You are not a member of company '${tenantId}'.` });
   }
   
-  res.json(user)
-})
-```
+  // 2. Fetch user's permissions for this tenant from your application database
+  const permissions = userPermissionsDb[userId]?.[tenantId];
+  if (!permissions) {
+      return res.status(403).json({ message: `Access denied: You have no assigned role in this company.` });
+  }
 
-## 🔐 Common Patterns
+  // 3. Attach tenant context to the request
+  req.tenant = {
+    id: tenantId,
+    roles: permissions.roles,
+    products: permissions.products,
+  };
 
-### Protect Entire Route Groups
-
-```typescript
-// Protect all admin routes
-const adminRouter = express.Router()
-adminRouter.use(requireAdmin)
-adminRouter.get('/users', (req, res) => { /* admin only */ })
-adminRouter.get('/settings', (req, res) => { /* admin only */ })
-app.use('/api/admin', adminRouter)
-```
-
-### Conditional Rendering Based on Roles
-
-```tsx
-function Dashboard() {
-  const { hasRole } = useAuth()
-  
-  return (
-    <div>
-      <h1>Dashboard</h1>
-      
-      {hasRole('admin') && <AdminPanel />}
-      {hasRole('manager') && <ManagerPanel />}
-      {(hasRole('staff') || hasRole('manager')) && <StaffPanel />}
-    </div>
-  )
+  next();
 }
 ```
 
-### Custom Hook for API Calls
+### Step 4: Create Tenant-Aware Role Middleware (`src/middleware/requireTenantRole.ts`)
 
-```tsx
-import { useAuth } from '../contexts/AuthContext'
-import { useState, useCallback } from 'react'
+This middleware checks for roles within the context established by `tenantContext`.
 
-interface ApiError {
-  message: string
-  status: number
+```typescript:src/middleware/requireTenantRole.ts
+import type { Request, Response, NextFunction } from 'express';
+
+export function requireTenantRole(requiredRole: string | string[]) {
+  return (req: Request, res: Response, next: NextFunction) => {
+    if (!req.tenant) {
+      return res.status(500).json({ message: 'Server error: Company context not established.' });
+    }
+    const userRoles = req.tenant.roles;
+    const required = Array.isArray(requiredRole) ? requiredRole : [requiredRole];
+    const hasRole = required.some(role => userRoles.includes(role));
+
+    if (hasRole) {
+      return next();
+    }
+    res.status(403).json({ message: `Access denied: Requires one of these roles: ${required.join(', ')}` });
+  };
 }
+```
+
+### Step 5: Apply Middleware to Your Routes (`src/index.ts`)
+
+Structure your Express app to use these new middleware correctly.
+
+```typescript:src/index.ts
+import express from 'express';
+import { jwtCheck, handleJwtError } from './middleware/auth';
+import { tenantContext } from './middleware/tenantContext';
+import { requireTenantRole } from './middleware/requireTenantRole';
+
+const app = express();
+
+// A router for all authenticated, tenant-specific API calls
+const tenantApi = express.Router();
+
+// Apply middleware in order:
+// 1. Validate the JWT to get `req.auth`
+tenantApi.use(jwtCheck);
+// 2. Establish tenant context to get `req.tenant`
+tenantApi.use(tenantContext);
+
+// Example route accessible to any valid member of the tenant
+tenantApi.get('/projects', (req, res) => {
+  res.json({ message: `Project list for company ${req.tenant?.id}` });
+});
+
+// Example route that requires the 'admin' role within that specific tenant
+tenantApi.get('/settings', requireTenantRole('admin'), (req, res) => {
+  res.json({ message: `Admin settings for company ${req.tenant?.id}` });
+});
+
+// Mount the tenant-aware router
+app.use('/api/v1', tenantApi);
+
+// Add JWT error handler AFTER all routes
+app.use(handleJwtError);
+
+app.listen(3001, () => console.log('Server running on port 3001'));
+```
+
+---
+
+##  frontend-setup Frontend Setup (React + TypeScript)
+
+The frontend no longer checks roles directly. Instead, it securely stores the user's identity and provides the necessary context (`tenantId`) for all API calls.
+
+### Step 1: Update AuthContext (`src/contexts/AuthContext.tsx`)
+
+The `AuthContext` is now simpler. It no longer stores or checks for roles.
+
+```typescript:src/contexts/AuthContext.tsx
+// ...
+interface User {
+   id?: string;
+   username?: string;
+   // `roles` array is removed
+}
+
+interface AuthContextType {
+   // `hasRole` function is removed
+   // ...
+}
+
+// ... in AuthProvider
+const parseUser = useCallback(async (kc: Keycloak) => {
+  // Logic to parse roles is removed
+}, []);
+// ...
+```
+
+### Step 2: Create a Tenant Management System (Conceptual)
+
+In a real application, you would need:
+1.  **A TenantContext:** A new React context to store the `currentTenantId`.
+2.  **A Tenant Selector:** If a user belongs to multiple groups (companies), you must show a UI after login for them to select which company they want to work in. This selection would set the `currentTenantId` in your `TenantContext`.
+
+### Step 3: Update API Hook to be Tenant-Aware (`src/hooks/useApiCall.ts`)
+
+Your `useApiCall` hook is now responsible for sending the `X-Tenant-ID` header.
+
+```typescript:src/hooks/useApiCall.ts
+import { useAuth } from '../contexts/AuthContext';
+// import { useTenant } from '../contexts/TenantContext'; // You would create this
 
 export function useApiCall() {
-  const { getToken } = useAuth()
-  const [loading, setLoading] = useState(false)
-  const [error, setError] = useState<ApiError | null>(null)
+  const { getToken } = useAuth();
+  // const { currentTenantId } = useTenant(); // Get selected tenant from context
 
   const apiCall = useCallback(async <T>(
+    tenantId: string, // Pass tenantId directly for this example
     endpoint: string, 
     options: RequestInit = {}
   ): Promise<T> => {
-    setLoading(true)
-    setError(null)
+    const token = await getToken();
     
-    try {
-      const token = await getToken()
-      
-      const response = await fetch(endpoint, {
-        ...options,
-        headers: {
-          'Authorization': `Bearer ${token}`,
-          'Content-Type': 'application/json',
-          ...options.headers
-        }
-      })
-      
-      if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`)
-      }
-      
-      return await response.json()
-    } catch (err) {
-      const apiError: ApiError = {
-        message: err instanceof Error ? err.message : 'Unknown error',
-        status: 0
-      }
-      setError(apiError)
-      throw apiError
-    } finally {
-      setLoading(false)
+    const response = await fetch(`/api/v1${endpoint}`, { // Note the /v1 path
+      ...options,
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'Content-Type': 'application/json',
+        'X-Tenant-ID': tenantId, // The crucial header
+        ...options.headers,
+      },
+    });
+    
+    if (!response.ok) {
+      throw new Error(`HTTP error! status: ${response.status}`);
     }
-  }, [getToken])
+    return response.json();
+  }, [getToken]);
 
-  return { apiCall, loading, error }
+  return { apiCall };
 }
+```
 
-// Usage
-function MyComponent() {
-  const { apiCall, loading, error } = useApiCall()
-  const [data, setData] = useState(null)
+### Step 4: Use in Components
 
-  const fetchData = async () => {
-    try {
-      const result = await apiCall('/api/some-endpoint')
-      setData(result)
-    } catch (err) {
-      console.error('Failed to fetch data:', err)
-    }
-  }
+UI rendering based on permissions is now driven by data fetched from the backend, not by the content of the JWT.
+
+```tsx
+function Dashboard() {
+  const { apiCall } = useApiCall();
+  const [permissions, setPermissions] = useState({ roles: [], products: [] });
+  // Assume 'company-a' is the selected tenant
+  const currentTenantId = 'company-a';
+
+  useEffect(() => {
+    // Fetch the user's permissions for the current tenant when the app loads
+    apiCall(currentTenantId, '/me/permissions')
+      .then(setPermissions)
+      .catch(console.error);
+  }, [apiCall, currentTenantId]);
+
+  const hasPermission = (role: string) => permissions.roles.includes(role);
 
   return (
     <div>
-      <button onClick={fetchData} disabled={loading}>
-        {loading ? 'Loading...' : 'Fetch Data'}
-      </button>
-      {error && <p>Error: {error.message}</p>}
-      {data && <pre>{JSON.stringify(data, null, 2)}</pre>}
+      <h1>Dashboard for {currentTenantId}</h1>
+      
+      {hasPermission('admin') && <AdminPanel />}
+      {permissions.products.includes('product1') && <ProductOneWidget />}
     </div>
-  )
+  );
 }
 ```
 
-### Loading States
-
-```tsx
-function MyComponent() {
-  const { loading, isAuthenticated } = useAuth()
-  
-  if (loading) {
-    return <div>Checking authentication...</div>
-  }
-  
-  if (!isAuthenticated) {
-    return <div>Please log in</div>
-  }
-  
-  return <div>Your authenticated content</div>
-}
-```
-
-## 🛡️ Security Rules
+## 🔐 Security Rules
 
 ### DO's
-- ✅ Always use TypeScript for better type safety
-- ✅ Always use `getToken()` for API calls
-- ✅ Check roles on both frontend AND backend
-- ✅ Use the provided middleware exactly as shown
-- ✅ Handle loading states properly
-- ✅ Add error handling to your API calls
-- ✅ Validate environment variables on startup
+- ✅ **Centralize Authorization**: All permission logic lives in your backend.
+- ✅ **Use Keycloak Groups for Tenancy**: Groups are a robust way to manage which users belong to which company.
+- ✅ **Send Tenant Context**: Always send the `X-Tenant-ID` header for API calls that require it.
+- ✅ **Fetch Permissions from API**: The frontend should query an endpoint to get the user's permissions for the active tenant to correctly render the UI.
+- ✅ **Validate Environment Variables**: Ensure your backend has all necessary Keycloak configuration on startup.
 
 ### DON'Ts
-- ❌ Don't store tokens in localStorage
-- ❌ Don't trust frontend role checks alone
-- ❌ Don't modify the AuthContext without understanding it
-- ❌ Don't forget the error handler middleware
-- ❌ Don't hardcode tokens
-- ❌ Don't use JavaScript when TypeScript is available
-
-## 🔧 Common Issues & Solutions
-
-### "Token is invalid" Error
-- Check your Keycloak server URL is correct
-- Verify your realm and client ID match Keycloak config
-- Ensure your client is properly configured in Keycloak
-
-### "Access denied" Error
-- Check user has the required role in Keycloak
-- Verify role is assigned to the correct client or realm
-- Check the role name matches exactly (case-sensitive)
-
-### CORS Issues
-- Add your frontend URL to "Valid Redirect URIs" in Keycloak
-- Add your frontend domain to "Web Origins" in Keycloak
-
-### TypeScript Compilation Errors
-- Ensure all type definitions are installed
-- Check that environment variables are properly typed
-- Verify the Request interface extension is working
-
-### Loading Never Finishes
-- Check browser console for errors
-- Verify Keycloak server is accessible
-- Check network requests in browser dev tools
-
-## 📝 Quick Reference
-
-### AuthContext Hook (TypeScript)
-```tsx
-const {
-  user,           // User | null
-  isAuthenticated, // boolean
-  loading,        // boolean
-  signIn,         // () => void
-  signOut,        // () => void
-  getToken,       // () => Promise<string | undefined>
-  hasRole         // (role: string) => boolean
-} = useAuth()
-```
-
-### Backend Middleware (TypeScript)
-```typescript
-jwtCheck              // JWT validation middleware
-requireAdmin          // Requires 'admin' role
-requireRole('role')   // Requires specific role
-requireAnyRole([...]) // Requires any of the listed roles
-handleJwtError        // Error handler (add last)
-```
-
-### User Object Type
-```typescript
-interface User {
-  id?: string
-  username?: string
-  email?: string
-  name?: string
-  firstName?: string
-  lastName?: string
-  roles?: string[]
-  emailVerified?: boolean
-}
-```
-
-### Request Type (Backend)
-```typescript
-interface Request extends express.Request {
-  auth?: DecodedJwt  // Available after jwtCheck middleware
-}
-```
-
-## 🎯 That's It!
-
-Follow these steps exactly using TypeScript and you'll have working Keycloak authentication with full type safety. The provided code handles all the complex parts like token refresh, role management, and error handling.
-
-Need help? Check the browser console and TypeScript compiler for detailed error messages and refer to the troubleshooting section above.
+- ❌ **Never Trust the Frontend**: Do not make authorization decisions based on data sent from the client, other than the JWT and the `X-Tenant-ID`.
+- ❌ **Don't Put Roles in the JWT**: Avoid putting application-specific roles (`admin`, `manager`) in the JWT. This creates a distributed, hard-to-manage authorization system. The JWT should only contain identity and tenant membership.
+- ❌ **Don't Forget the JWT Error Handler**: It's crucial for providing clear error messages to the client.
+- ❌ **Don't Mix Authorization Models**: Stick to a single, clear model. In this architecture, the application is the sole authority on permissions.

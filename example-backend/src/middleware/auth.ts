@@ -6,26 +6,24 @@ import type { NextFunction, Request, Response } from "express";
 
 // Define the structure of the JWT payload we expect from Keycloak
 interface DecodedJwt {
+   // We only care about the user's identity (sub) and their tenant memberships (groups)
+   sub: string;
+   groups?: string[]; // e.g., ['/company-a', '/company-b']
+
+   // Standard JWT claims
    exp: number;
    iat: number;
-   auth_time?: number;
-   jti: string;
    iss: string;
    aud: string | string[];
-   sub: string;
-   typ: string;
    azp: string;
+
+   // Other potential claims from Keycloak - we don't use them for authorization
+   auth_time?: number;
+   jti: string;
+   typ: string;
    session_state?: string;
    acr?: string;
    'allowed-origins': string[];
-   realm_access?: {
-      roles?: string[];
-   };
-   resource_access?: {
-      [clientId: string]: {
-         roles?: string[];
-      };
-   };
    scope?: string;
    sid?: string;
    email_verified?: boolean;
@@ -34,10 +32,10 @@ interface DecodedJwt {
    given_name?: string;
    family_name?: string;
    email?: string;
-   // Add any other custom claims you expect
 }
 
 // Extend Express Request type
+// This allows us to safely access `req.auth` after the `jwtCheck` middleware runs.
 declare global {
    namespace Express {
       export interface Request {
@@ -49,6 +47,8 @@ declare global {
 const keycloakIssuer = `${env.KEYCLOAK_URL}/realms/${env.KEYCLOAK_REALM}`;
 
 // JWT validation middleware
+// This middleware's only job is AUTHENTICATION: it verifies the token's signature
+// and attaches the decoded payload to `req.auth`. It does not handle AUTHORIZATION.
 export const jwtCheck = expressjwt({
    secret: expressJwtSecret({
       cache: true,
@@ -56,86 +56,14 @@ export const jwtCheck = expressjwt({
       jwksRequestsPerMinute: 5,
       jwksUri: `${keycloakIssuer}/protocol/openid-connect/certs`,
    }) as GetVerificationKey,
-   audience: [env.KEYCLOAK_CLIENT_ID, "account"], // Temporarily accept "account" audience
+   audience: [env.KEYCLOAK_CLIENT_ID, "account"],
    issuer: keycloakIssuer,
    algorithms: ["RS256"],
-   // credentialsRequired: false, // Set to false if you want to allow access to routes even if no token is provided.
-   // req.auth will be undefined in such cases.
-   // For more granular control, apply this middleware selectively or use .unless()
 });
 
-export function getRolesFromToken(decodedToken: DecodedJwt | undefined): string[] {
-   if (!decodedToken) {
-      return [];
-   }
-   // Prioritize resource_access roles for the specific client ID, then realm_access roles.
-   // Adjust env.KEYCLOAK_CLIENT_ID if a different client ID's roles are needed here.
-   const resourceRoles = decodedToken.resource_access?.[env.KEYCLOAK_CLIENT_ID]?.roles || [];
-   const realmRoles = decodedToken.realm_access?.roles || [];
-
-   // Using a Set to ensure uniqueness if roles overlap (unlikely for distinct resource/realm roles)
-   return Array.from(new Set([...resourceRoles, ...realmRoles]));
-}
-
-export function requireAdmin(req: Request, res: Response, next: NextFunction): void {
-   if (!req.auth) {
-      res.status(401).json({ message: "Authentication required", error: "UNAUTHORIZED" });
-      return;
-   }
-   const roles = getRolesFromToken(req.auth);
-   if (roles.includes("admin")) {
-      next();
-   } else {
-      console.warn('Admin access denied:', { userId: req.auth.sub, roles, requiredRole: "admin" });
-      res.status(403).json({
-         message: "Access denied: Administrator privileges required",
-         error: "FORBIDDEN"
-      });
-   }
-}
-
-export function requireRole(role: string) {
-   return (req: Request, res: Response, next: NextFunction): void => {
-      if (!req.auth) {
-         res.status(401).json({ message: "Authentication required", error: "UNAUTHORIZED" });
-         return;
-      }
-      const userRoles = getRolesFromToken(req.auth);
-      if (userRoles.includes(role)) {
-         next();
-      } else {
-         console.warn('Role access denied:', { userId: req.auth.sub, roles: userRoles, requiredRole: role });
-         res.status(403).json({
-            message: `Access denied: '${role}' role required`,
-            error: "FORBIDDEN"
-         });
-      }
-   };
-}
-
-export function requireAnyRole(roles: string[]) {
-   return (req: Request, res: Response, next: NextFunction): void => {
-      if (!req.auth) {
-         res.status(401).json({ message: "Authentication required", error: "UNAUTHORIZED" });
-         return;
-      }
-      const userRoles = getRolesFromToken(req.auth);
-      const hasRequiredRole = roles.some(role => userRoles.includes(role));
-
-      if (hasRequiredRole) {
-         next();
-      } else {
-         console.warn('Any role access denied:', { userId: req.auth.sub, roles: userRoles, requiredRoles: roles });
-         res.status(403).json({
-            message: `Access denied: One of the following roles required: ${roles.join(', ')}`,
-            error: "FORBIDDEN"
-         });
-      }
-   };
-}
 
 // Error handler for express-jwt errors.
-// This should be registered in app.ts AFTER routes and AFTER jwtCheck middleware.
+// This should be registered in the main app file AFTER all routes.
 export function handleJwtError(err: any, req: Request, res: Response, next: NextFunction) {
    if (err.name === 'UnauthorizedError') {
       console.warn('JWT UnauthorizedError:', { error: err.message, path: req.path, code: err.code });
